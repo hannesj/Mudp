@@ -1,0 +1,185 @@
+
+#define _BSD_SOURCE 1
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <signal.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <string.h>
+#include <pcap.h>
+#include <netinet/if_ether.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include "mudpc.h"
+
+#define MAX_CLIENT 255
+#define ETHERNET_HEADER_LEN 14
+#define BUFFER_SIZE (1 << 16)
+#define MSG_SIZE 1000
+#define PORT 4135   
+
+int sock, ret, flags, size, conn_sock;
+int i, reuse = 1, s_fd;
+int addr_count = 0;
+char buffer[BUFFER_SIZE];
+socklen_t from_len;
+void event_cb (unsigned short aid, unsigned char type, void * buf, int buf_len);
+void data_cb(unsigned short aid, void * buf, int buf_len);
+
+int ip_sock_map_table [MAX_CLIENT];
+
+char bouncer_addr[18];
+char target_addr[18];
+unsigned int client_ip;
+
+unsigned char pkt[2000];
+
+void process_pkt(u_char *args, const struct pcap_pkthdr *header,
+        const u_char *p);
+
+struct sockaddr_in addr, peer, temp;
+struct sockaddr_in *laddr[10];
+struct sockaddr_in *paddrs[10];
+
+int sock;
+
+int main(int argc, char **argv)
+{
+
+    pthread_t thread_id;
+    pcap_t * handle;
+    char error_buf[PCAP_ERRBUF_SIZE];
+    char local_addr[4][20];
+    int optval, i;
+
+    if(argc < 4 )
+    {
+        puts("Usage: ERROR");        
+        return 0;
+    }
+
+    /* Try to open the network interface for sniffing */
+    handle = pcap_open_live(argv[1], 2000, 1, 1000, error_buf); 
+    if (NULL == handle)
+    {
+        printf ("Error opening the device for sniffing %s \r\n", error_buf);
+        return -1;
+    }
+
+    for (i = 0; i < (argc-3); i++)
+    {
+        /* Read the local address to bind to */
+        strcpy(local_addr[i], argv[2+i]);
+    }
+
+    inet_aton(argv[2+i], &(temp.sin_addr));
+    client_ip = temp.sin_addr.s_addr;
+
+ 
+    /* Open the raw socket for sending the constucted ip packets */
+    s_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (s_fd < 0)
+    {
+        printf ("Error in creating RAW socket \r\n");
+    }
+
+    /* Set socket options */
+    optval = 1;
+    setsockopt(s_fd, IPPROTO_IP, IP_HDRINCL, &optval, sizeof(int));
+    perror("setsockopt");
+
+    /* Create a MUDP socket */
+    sock = mudp_socket_create(
+                   i,
+                   local_addr,
+                   9900,
+                   event_cb
+               );
+
+    if (sock != 1)
+    {
+        printf ("Socket Creation failed\r\n");
+        exit (0);
+    }
+
+    /* PCAP READ loop */
+    pcap_loop(handle, -1, process_pkt, NULL);
+
+    return 0;    
+}  
+
+void event_cb (unsigned short aid, unsigned char type, void * buf, int buf_len)
+{
+    printf ("NEW CONNECTION\r\n");
+    /* Register a data callback */
+    mudp_register_data_cb (aid, data_cb);
+}
+
+void data_cb(unsigned short aid, void * buf, int buf_len)
+{
+    int ret;
+    struct sockaddr_in addr;
+    int from_len = sizeof (addr);
+    struct sockaddr_in dest;
+    struct iphdr *ip_hdr;
+
+    ip_hdr = (struct iphdr *) buf;
+
+    /* Record the ip information */
+    ip_sock_map_table [(ip_hdr->saddr) >> 24] = aid;
+
+    dest.sin_family = AF_INET;
+    dest.sin_addr.s_addr = client_ip;
+
+    /* Send the packet over the raw socket */
+    if ((ret = sendto(s_fd, buf, buf_len, 0, (struct sockaddr *)&dest, sizeof(struct sockaddr))) < 0)
+    {
+        printf ("Sending over raw socket failed!!\r\n");
+        perror("sendto");
+    }
+    else
+    {
+        printf("%d -> RAW\r\n", buf_len);
+    }
+    return;
+}
+
+void process_pkt(u_char *args, const struct pcap_pkthdr *header,
+        const u_char *p)
+{
+    unsigned short aid;
+    struct iphdr *ip_hdr;
+    memset (pkt, 0x00, 2000);
+    ip_hdr = (struct iphdr *)(p);
+
+    
+    if ((ip_hdr->ihl < 5) && (ip_hdr->ihl > 15))
+    {
+         return;
+    }
+    
+    if (ip_hdr->saddr != client_ip)
+    {
+             return;
+    }
+
+    aid = (unsigned short)ip_sock_map_table [(ip_hdr->daddr) >> 24];
+    
+    /* Copy the packet in to a buffer */
+    memcpy (pkt, (p), header->caplen);
+
+    /* Send the pack over MUDP */
+    mudpc_send(aid, pkt, header->caplen);
+
+    printf("%d <- PCAP \n",header->caplen);
+
+}
+
